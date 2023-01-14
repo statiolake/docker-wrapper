@@ -1,39 +1,88 @@
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 const DISTRO_ROOTFS_URL: &str =
     "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz";
-const DISTRO_NAME: &str = "docker-host";
+const DISTRO_NAME: &str = "custom-docker-host";
+const CONTEXT_NAME: &str = "custom-linux-docker-host";
+const DOCKER_HOST: &str = "localhost:22432";
+
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| panic!("critical error: failed to get home directory"))
+}
 
 fn distro_dir_path(name: &str) -> PathBuf {
-    let home =
-        dirs::home_dir().unwrap_or_else(|| panic!("critical error: failed to get home directory"));
+    let home = home_dir();
     home.join("wsl-distros").join(name)
 }
 
-fn run(cmd: &[&str], silent: bool) -> Result<bool> {
+fn find_native_docker_cli_path() -> PathBuf {
+    let mut path = home_dir();
+    path.extend(Path::new("scoop/shims/docker.exe").components());
+    path
+}
+
+fn run(args: &[&str], silent: bool, set_context: bool) -> Result<bool> {
     let (stdout, stderr) = if silent {
         (Stdio::null(), Stdio::null())
     } else {
         (Stdio::inherit(), Stdio::inherit())
     };
-    let status = Command::new(cmd[0])
-        .args(&cmd[1..])
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()?
-        .wait()?;
+
+    let mut cmd = Command::new(args[0]);
+    cmd.args(&args[1..]).stdout(stdout).stderr(stderr);
+    if set_context {
+        cmd.env("DOCKER_CONTEXT", CONTEXT_NAME);
+    }
+
+    let status = cmd.spawn()?.wait()?;
+
     Ok(status.success())
 }
 
-fn run_in_wsl(cmd_in_wsl: &[&str], silent: bool) -> Result<bool> {
-    let mut cmd = vec!["wsl", "-d", DISTRO_NAME, "-e"];
-    cmd.extend(cmd_in_wsl);
-    run(&cmd, silent)
+fn run_in_wsl(args_in_wsl: &[&str], silent: bool) -> Result<bool> {
+    let mut args = vec!["wsl", "-d", DISTRO_NAME, "-e"];
+    args.extend(args_in_wsl);
+    run(&args, silent, false)
+}
+
+fn ensure_native_docker_cli() -> Result<()> {
+    let native_cli = find_native_docker_cli_path();
+    if !native_cli.exists() {
+        bail!(
+            "failed to find native docker cli at {}",
+            native_cli.display()
+        );
+    }
+
+    let native_cli = native_cli.to_string_lossy();
+
+    run(
+        &[&*native_cli, "context", "rm", "-f", CONTEXT_NAME],
+        true,
+        false,
+    )?;
+    ensure!(
+        run(
+            &[
+                &*native_cli,
+                "context",
+                "create",
+                CONTEXT_NAME,
+                "--docker",
+                &format!("host=tcp://{DOCKER_HOST}")
+            ],
+            true,
+            false,
+        )?,
+        "failed to create docker context"
+    );
+
+    Ok(())
 }
 
 fn ensure_docker() -> Result<()> {
@@ -73,6 +122,7 @@ fn download_and_import_rootfs() -> Result<()> {
                     "-o",
                     &download_path.display().to_string(),
                 ],
+                false,
                 false
             )?,
             "failed to download rootfs"
@@ -88,6 +138,7 @@ fn download_and_import_rootfs() -> Result<()> {
                 &distro_root_path.display().to_string(),
                 &download_path.display().to_string()
             ],
+            false,
             false
         )?,
         "failed to import distro"
@@ -122,7 +173,9 @@ fn setup_docker_on_distro() -> Result<()> {
             &[
                 "sh",
                 "-c",
-                r#"mkdir -p /etc/docker && echo '{"features":{"buildkit":true}}' > /etc/docker/daemon.json"#
+                &format!(
+                    r#"mkdir -p /etc/docker && echo '{{"features":{{"buildkit":true}},"hosts":["{DOCKER_HOST}"]}}' > /etc/docker/daemon.json"#
+                )
             ],
             true
         )?,
@@ -133,12 +186,15 @@ fn setup_docker_on_distro() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    ensure_native_docker_cli()?;
     ensure_docker()?;
 
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let mut cmd = vec!["docker"];
-    cmd.extend(args.iter().map(|arg| &**arg));
-    run_in_wsl(&cmd, false)?;
+    let native_cli_path = find_native_docker_cli_path();
+    let native_cli_path = native_cli_path.to_string_lossy();
+    let mut modified_args = vec![&*native_cli_path];
+    modified_args.extend(args.iter().map(|arg| &**arg));
+    run(&modified_args, false, true)?;
 
     Ok(())
 }
