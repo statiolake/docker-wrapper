@@ -37,7 +37,7 @@ fn run_in_wsl(cmd_in_wsl: &[&str], silent: bool) -> Result<bool> {
 }
 
 fn ensure_docker() -> Result<()> {
-    if !run_in_wsl(&["docker", "version"], true)? {
+    if !run_in_wsl(&["docker", "help"], true)? {
         setup_docker_distro()?;
     }
     run_in_wsl(&["/sbin/service", "docker", "start"], true)?;
