@@ -224,7 +224,7 @@ fn handle_extra_subcommand(args: &mut [String]) -> Result<bool> {
     }
 
     match &*args[0] {
-        "stop" => {
+        "stop-daemon" => {
             run(&["wsl", "--shutdown"], true)?;
 
             Ok(true)
