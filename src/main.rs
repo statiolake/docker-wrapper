@@ -26,7 +26,20 @@ fn find_native_docker_cli_path() -> PathBuf {
     path
 }
 
+fn output(args: &[&str], set_context: bool) -> Result<String> {
+    // eprintln!("output: {:?}", args);
+    let mut cmd = Command::new(args[0]);
+    cmd.args(&args[1..]);
+    if set_context {
+        cmd.env("DOCKER_CONTEXT", CONTEXT_NAME);
+    }
+    let output = cmd.output()?;
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn run(args: &[&str], silent: bool, set_context: bool) -> Result<bool> {
+    // eprintln!("run: {:?}", args);
     let (stdout, stderr) = if silent {
         (Stdio::null(), Stdio::null())
     } else {
@@ -61,11 +74,10 @@ fn ensure_native_docker_cli() -> Result<()> {
 
     let native_cli = native_cli.to_string_lossy();
 
-    run(
-        &[&*native_cli, "context", "rm", "-f", CONTEXT_NAME],
-        true,
-        false,
-    )?;
+    if output(&[&*native_cli, "context", "ls"], false)?.contains(CONTEXT_NAME) {
+        return Ok(());
+    }
+
     ensure!(
         run(
             &[
@@ -86,7 +98,7 @@ fn ensure_native_docker_cli() -> Result<()> {
 }
 
 fn ensure_docker() -> Result<()> {
-    if !run_in_wsl(&["docker", "help"], true)? {
+    if !run_in_wsl(&["which", "docker"], true)? {
         setup_docker_distro()?;
     }
     run_in_wsl(&["/sbin/service", "docker", "start"], true)?;
@@ -185,16 +197,64 @@ fn setup_docker_on_distro() -> Result<()> {
     Ok(())
 }
 
+fn convert_path(from: &str) -> Result<String> {
+    output(
+        &["wsl", "-d", DISTRO_NAME, "-e", "wslpath", "-u", from],
+        false,
+    )
+    .map(|s| s.trim().to_string())
+}
+
+fn modify_args(args: &mut [String]) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+
+    if args[0] == "create" {
+        fix_bind_mount_path(args)?;
+    }
+
+    Ok(())
+}
+
+fn fix_bind_mount_path(args: &mut [String]) -> Result<()> {
+    let mut is_mount_option = false;
+    for arg in args {
+        if is_mount_option {
+            is_mount_option = false;
+            let mut opts: Vec<String> = arg.split(',').map(|s| s.to_string()).collect();
+            for opt in &mut opts {
+                if opt.starts_with("source=") {
+                    let path = &opt["source=".len()..];
+                    let path = convert_path(path)?;
+                    *opt = format!("source={path}");
+                }
+            }
+            *arg = opts.join(",");
+
+            continue;
+        }
+
+        if arg.trim() == "--mount" {
+            is_mount_option = true;
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     ensure_native_docker_cli()?;
     ensure_docker()?;
 
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    modify_args(&mut args)?;
+
     let native_cli_path = find_native_docker_cli_path();
     let native_cli_path = native_cli_path.to_string_lossy();
-    let mut modified_args = vec![&*native_cli_path];
-    modified_args.extend(args.iter().map(|arg| &**arg));
-    run(&modified_args, false, true)?;
+    let mut native_args = vec![&*native_cli_path];
+    native_args.extend(args.iter().map(|arg| &**arg));
+    ensure!(run(&native_args, false, true)?, "docker failed");
 
     Ok(())
 }
